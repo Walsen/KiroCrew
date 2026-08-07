@@ -11,6 +11,7 @@ import { safeSetItem } from '../utils/safeStorage'
 import type { McpAppRenderPayload } from '../lib/mcpAppSrcdoc'
 import { i18nT } from '../i18n/t'
 import { secureRandomId } from '../utils/secureId'
+import { mergeIntoDraft } from '../utils/chatDrafts'
 
 const SKIP_ROLES = new Set(['chunk', 'done'])
 const filterMessages = (msgs: ChatMessage[]) => msgs.filter(m => !SKIP_ROLES.has(m.role))
@@ -269,6 +270,15 @@ export interface SideMessage {
   ts: string
   run_id?: string
   is_error?: boolean
+  /** Injected into a turn that was already running, not asked from idle. */
+  steer?: boolean
+}
+
+/** One side question held behind an in-flight side turn. */
+export interface SideQueueEntry {
+  id: string
+  content: string
+  ts: string
 }
 
 export interface SideState {
@@ -276,6 +286,19 @@ export interface SideState {
   lastRunId?: string
   pending?: boolean
   streaming?: boolean
+  /** Questions queued behind the running turn, oldest first. */
+  queue?: SideQueueEntry[]
+  /** Text a cancel released, waiting for the panel to put it in the composer.
+   *  Set by whichever convergence path lands first; cleared once consumed, so a
+   *  lost HTTP response cannot mean lost text and neither path double-applies. */
+  releasedText?: string
+  /** Queue ids that have reached a TERMINAL state (drained or cancelled).
+   *  A submit's HTTP callback can run after the frame that removed its entry,
+   *  and re-pushing then shows a card the server no longer has — one that 404s
+   *  on cancel. The server cannot rule this out for us: its `still_queued`
+   *  answer is already stale by the time the callback runs. Bounded, because
+   *  only the recent past can still be raced. */
+  removedQueueIds?: string[]
   openedAtTurnCount: number
   createdAt: string
 }
@@ -433,6 +456,8 @@ interface ChatState {
   // predate the send). Cleared on server confirmation or turn end.
   pendingTurnSlot: string | null
 }
+
+const MAX_RETIRED_QUEUE_IDS = 50
 
 const initialState: ChatState = {
   activeSlot: null,
@@ -1878,8 +1903,8 @@ const chatSlice = createSlice({
         }
       }
     },
-    sseSideResult(state, action: PayloadAction<{ slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; is_error?: boolean; final?: boolean }>) {
-      const { slot, run_id, role, content, ts, is_error, final } = action.payload
+    sseSideResult(state, action: PayloadAction<{ slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; is_error?: boolean; final?: boolean; steer?: boolean }>) {
+      const { slot, run_id, role, content, ts, is_error, final, steer } = action.payload
       if (isUnsafeKey(slot)) return
       const tsIso = typeof ts === 'number' ? new Date(ts * 1000).toISOString() : new Date().toISOString()
       // Intentional re-open (new user frame) clears the closed sentinel
@@ -1896,6 +1921,39 @@ const chatSlice = createSlice({
       }
       const side: SideState = state.slotSide[slot]
       if (role === 'user') {
+        if (steer) {
+          // A steer joins a turn whose answer is already streaming. Land the chip
+          // ABOVE that answer: the terminal frame replaces the whole assistant
+          // text, so it must still match that row — putting the user bubble after
+          // it would strand the reply and make the terminal frame append the full
+          // text a second time.
+          //
+          // Locate the row by run, not by position. The steer RPC can settle after
+          // the NEXT queued turn has already started, so this run's answer may no
+          // longer be the tail; appending then would file an older steer below a
+          // newer turn and scramble the transcript.
+          const entry: SideMessage = { role: 'user', content, ts: tsIso, run_id, steer: true }
+          let answerIdx = -1
+          for (let i = side.messages.length - 1; i >= 0; i--) {
+            const row = side.messages[i]
+            if (row.role === 'assistant' && row.run_id === run_id) {
+              answerIdx = i
+              break
+            }
+          }
+          if (answerIdx >= 0) {
+            side.messages.splice(answerIdx, 0, entry)
+          } else {
+            // No answer for this run yet — the chip legitimately precedes it.
+            side.messages.push(entry)
+          }
+          // Deliberately touches NEITHER pending/streaming NOR lastRunId. A steer
+          // frame can arrive after its turn's terminal frame, or after a later turn
+          // has begun; reviving busy state strands the panel (no later frame would
+          // clear it) and rewriting lastRunId regresses run identity to a turn that
+          // already ended. A steer never STARTS a turn, so it owns neither.
+          return
+        }
         // Reconcile with optimistic bubble appended in sideOptimisticAppend.
         const lastUser = side.messages[side.messages.length - 1]
         if (lastUser?.role === 'user' && lastUser.content === content && !lastUser.run_id) {
@@ -1925,6 +1983,94 @@ const chatSlice = createSlice({
       }
       side.messages.push({ role: 'assistant', content, ts: tsIso, run_id })
       side.lastRunId = run_id
+    },
+    sseSideQueue(state, action: PayloadAction<{ slot: string; action: 'push' | 'edit' | 'cancel' | 'drain'; queue_id: string; content?: string; ts?: number; front?: boolean }>) {
+      const { slot, action: kind, queue_id, content, ts, front } = action.payload
+      if (isUnsafeKey(slot)) return
+      // A queue mutation is never a reason to resurrect a closed side.
+      if (!state.slotSide[slot]) {
+        if (kind !== 'push' || state.slotSideClosed[slot]) return
+        const parentTurnCount = slot === state.activeSlot
+          ? state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
+          : 0
+        state.slotSide[safeKey(slot)] = { messages: [], openedAtTurnCount: parentTurnCount, createdAt: new Date().toISOString() }
+      }
+      const side: SideState = state.slotSide[slot]
+      if (!side.queue) side.queue = []
+      const at = side.queue.findIndex(e => e.id === queue_id)
+      if (kind === 'push') {
+        // Already drained or cancelled: this push lost the race to the frame that
+        // retired it, so materialising a card would show a phantom.
+        if (side.removedQueueIds?.includes(queue_id)) return
+        const tsIso = typeof ts === 'number' ? new Date(ts * 1000).toISOString() : new Date().toISOString()
+        // Replay-safe: a redelivered push must not double the card. It must also
+        // not REWRITE it — broadcasts are redacted on the wire, so a late duplicate
+        // push carries a scrubbed rendering of text already stored raw from the
+        // HTTP response, and overwriting corrupts what a later cancel restores.
+        // Content changes arrive as `edit`, never as a second `push`, so ignoring
+        // the duplicate's content loses nothing.
+        if (at >= 0) return
+        // `front` mirrors the backend's own head-insert (a requeued steer, or an
+        // entry whose dispatch failed). Appending it instead would show a
+        // different next question than the backend will actually run.
+        else if (front) side.queue.unshift({ id: queue_id, content: content ?? '', ts: tsIso })
+        else side.queue.push({ id: queue_id, content: content ?? '', ts: tsIso })
+        return
+      }
+      if (at < 0) return
+      if (kind === 'edit') side.queue[at].content = content ?? side.queue[at].content
+      else {
+        // A cancel releases the entry's text: it is gone from the queue and gone
+        // from the server, so the composer is the only place left to hold it.
+        // Stashed here rather than restored by the caller because BOTH
+        // convergence paths land in this reducer — the HTTP response and the
+        // `chat.side_queue` frame — and a lost HTTP response must not mean lost
+        // text. The panel drains and clears it, so it releases exactly once.
+        if (kind === 'cancel') {
+          // Prefer the card's OWN content over the frame's. Broadcast payloads are
+          // redacted on the wire (`ws.py` scrubs credentials before sending), while
+          // the card was populated from the raw text the user typed via the HTTP
+          // response. Taking the frame first handed the composer a permanently
+          // redacted question — the user would have to retype the secret, or not
+          // notice and send `[REDACTED: credential]` as their prompt.
+          //
+          // The frame remains the fallback: if its push never populated a card
+          // (HTTP lost and only the WS frame arrived) a redacted release still
+          // beats losing the question entirely.
+          const released = side.queue[at].content || content || ''
+          // ACCUMULATE, never assign. Two cancellations can both settle before the
+          // panel's effect consumes this field, and an assignment would drop the
+          // first one's text for good — the exact loss this whole feature exists to
+          // prevent. The panel merges the accumulated value into the composer as a
+          // unit and clears it, so the user edits both questions rather than
+          // silently losing one.
+          if (released) {
+            side.releasedText = mergeIntoDraft(side.releasedText, released)
+          }
+        }
+        side.queue.splice(at, 1)
+        // Retire the id so a slower HTTP callback cannot bring it back.
+        const retired = side.removedQueueIds ?? []
+        retired.push(queue_id)
+        // Only the recent past can still be raced by an in-flight request, so a
+        // small window is enough and keeps this from growing without bound.
+        side.removedQueueIds = retired.slice(-MAX_RETIRED_QUEUE_IDS)
+      }
+    },
+    sideReleaseConsumed(state, action: PayloadAction<{ slot: string; consumed: string }>) {
+      const { slot, consumed } = action.payload
+      const side = state.slotSide[slot]
+      if (!side) return
+      const current = side.releasedText ?? ''
+      // Compare-and-clear, never a blind delete. A cancel can append to this
+      // buffer between the consumer's render and its effect, and deleting the
+      // whole field then discards text the consumer never saw. Keep whatever was
+      // appended after the snapshot it actually drained.
+      if (current === consumed || !current.startsWith(consumed)) {
+        delete side.releasedText
+        return
+      }
+      side.releasedText = current.slice(consumed.length).replace(/^\s+/, '')
     },
     sideClose(state, action: PayloadAction<string>) {
       delete state.slotSide[action.payload]
@@ -2762,6 +2908,6 @@ export const {
   sseSubagentSnapshot, sseToolActivity, sseToolResult, sseActivityEvent,
   sseMcpAppRender,
   sseWorkflowEvent, clearWorkflowRun,
-  sseSideResult, sideClose, sideOptimisticAppend, sideOptimisticRollback,
+  sseSideResult, sseSideQueue, sideReleaseConsumed, sideClose, sideOptimisticAppend, sideOptimisticRollback,
 } = chatSlice.actions
 export default chatSlice.reducer
