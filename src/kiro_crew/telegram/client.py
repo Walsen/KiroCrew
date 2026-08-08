@@ -20,7 +20,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 import aiohttp
@@ -229,6 +229,11 @@ class TelegramInbound:
     # Forum-topic id in a supergroup (Bot API ``message_thread_id``); None in a
     # 1:1 DM or the supergroup's General topic.
     message_thread_id: int | None = None
+    #: Raw file attachment dicts extracted from the Telegram update (photo,
+    #: document, audio, voice, video_note, video, animation). Each dict carries
+    #: at minimum ``file_id`` and ``file_unique_id``; optional fields include
+    #: ``file_size``, ``mime_type``, ``file_name``, and ``width``/``height``.
+    attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -479,6 +484,65 @@ class TelegramClient:
             },
         )
 
+    # ── File download (attachment ingestion) ──
+
+    #: The only host Telegram file downloads may resolve to. A redirect or
+    #: different host means the URL is not from Telegram and must be refused.
+    _FILE_HOST = "api.telegram.org"
+
+    async def download_file(self, file_id: str, dest: str) -> None:
+        """Download a Telegram file by ``file_id`` to *dest*.
+
+        Two-step process per Bot API docs:
+        1. ``getFile(file_id)`` → returns a ``File`` object with ``file_path``
+        2. Construct ``https://api.telegram.org/file/bot<token>/<file_path>``
+           and download the bytes.
+
+        Host-allowlisted: only ``api.telegram.org`` is accepted. Redirects are
+        refused so a compromised file_path cannot exfiltrate data via an open
+        redirect. Errors raise token-free messages (the download URL contains
+        the bot token, so aiohttp's default exception str() must never propagate).
+        """
+        result = await self._api("getFile", {"file_id": file_id})
+        if not result or not isinstance(result, dict):
+            raise ValueError(f"getFile returned no result for file_id={file_id!r}")
+        file_path = result.get("file_path", "")
+        if not file_path:
+            raise ValueError(f"getFile returned empty file_path for file_id={file_id!r}")
+
+        url = f"https://api.telegram.org/file/bot{self._token}/{file_path}"
+
+        session = await self._ensure_session()
+        try:
+            async with session.get(
+                url,
+                proxy=self._proxy,
+                timeout=aiohttp.ClientTimeout(total=60),
+                allow_redirects=False,
+            ) as resp:
+                if 300 <= resp.status < 400:
+                    raise ValueError("refusing redirected Telegram file URL")
+                if resp.status >= 400:
+                    # Token-free error: aiohttp's ClientResponseError embeds the
+                    # full URL (which contains the bot token) in its str().
+                    raise ValueError(
+                        f"Telegram file download failed (status {resp.status})"
+                    )
+                # Offload file I/O to a worker thread — a large attachment on
+                # slow/FUSE storage must not block the gateway event loop.
+                # Mirrors discord/client.py's download_attachment pattern.
+                fh = await asyncio.to_thread(open, dest, "wb")
+                try:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        await asyncio.to_thread(fh.write, chunk)
+                finally:
+                    await asyncio.to_thread(fh.close)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # Strip the token-bearing URL from transport exceptions.
+            raise ValueError(
+                f"Telegram file download transport error ({type(exc).__name__})"
+            ) from None
+
     # ── Polling loop ──
 
     async def _call_raw(self, method: str, params: dict, timeout: int = 15) -> Any:
@@ -611,9 +675,25 @@ class TelegramClient:
         """Route a single Update to the appropriate handler as a background task."""
         if "message" in update:
             msg = update["message"]
-            text = msg.get("text", "")
+            text = msg.get("text", "") or msg.get("caption", "")
             chat = msg.get("chat", {})
             user = msg.get("from", {})
+            # Extract file attachments. Telegram delivers each media type in its
+            # own top-level key. ``photo`` is an array of sizes — pick the last
+            # (largest). Each attachment dict carries at minimum ``file_id``.
+            attachments: list[dict[str, Any]] = []
+            if "photo" in msg and msg["photo"]:
+                # Largest photo is last in the array (Bot API guarantee).
+                largest = msg["photo"][-1]
+                # Synthesize a filename — photos have no file_name field.
+                largest.setdefault("file_name", "photo.jpg")
+                largest.setdefault("mime_type", "image/jpeg")
+                attachments.append(largest)
+            for key in ("document", "audio", "voice", "video_note", "video", "animation"):
+                if key in msg and isinstance(msg[key], dict):
+                    attachments.append(msg[key])
+            # Stickers are intentionally excluded — they are decorative, not
+            # content the model should ingest.
             inbound = TelegramInbound(
                 chat_id=chat.get("id", 0),
                 user_id=user.get("id", 0),
@@ -622,6 +702,7 @@ class TelegramClient:
                 message_id=msg.get("message_id", 0),
                 chat_type=chat.get("type", ""),
                 message_thread_id=msg.get("message_thread_id"),
+                attachments=attachments,
             )
             task = asyncio.create_task(self._invoke_message(inbound))
             self._handler_tasks.add(task)
